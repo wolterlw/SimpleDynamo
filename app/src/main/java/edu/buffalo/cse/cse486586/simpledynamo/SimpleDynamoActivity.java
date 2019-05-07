@@ -37,10 +37,13 @@ public class SimpleDynamoActivity extends Activity {
 			@Override
 			public void onClick(View v) {
 				Log.v("in activity", "initiating TEST");
-				ContentValues cv = new ContentValues();
-				cv.put("key", "some key");
-				cv.put("value", "some value");
-				getContentResolver().insert(provider_uri, cv);
+				for (int i=0; i < 50; i++){
+					ContentValues cv = new ContentValues();
+					cv.put("key", "key "+i);
+					cv.put("value", "value "+i);
+					getContentResolver().insert(provider_uri, cv);
+					Log.v("in activity", "inserted pair " + i);
+				}
 			}
 		});
 	}

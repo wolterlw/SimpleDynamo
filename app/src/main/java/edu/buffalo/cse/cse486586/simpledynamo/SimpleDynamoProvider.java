@@ -25,6 +25,7 @@ import android.content.ContentProvider;
 import android.content.ContentValues;
 import android.content.Context;
 import android.database.Cursor;
+import android.database.MatrixCursor;
 import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteOpenHelper;
 import android.net.Uri;
@@ -38,10 +39,10 @@ public class SimpleDynamoProvider extends ContentProvider {
 	String TAG="In content provider";
 	private String ownPort;
 	private int SERVER_PORT=10000;
-	private boolean INITIALIZED;
+	private boolean INITIALIZED = false;
 
 	private class InnerComm{
-		public Map<String, Integer> waiting_for = new HashMap<String, Integer>();
+		public Map<String, Record> waiting_for = new HashMap<String, Record>();
 	}
 	private InnerComm innerComm;
 
@@ -64,16 +65,16 @@ public class SimpleDynamoProvider extends ContentProvider {
 		private String[] ports;
 		private String[] serverPorts;
 		private String[] hashes;
-		private ArrayList<Integer> replicate;
-		private ArrayList<Integer> ownReplicas;
-		int ownIdx;
+		private int ownIdx;
+		private String[] recovSend;
+		private String[] recovSendAs;
 
 		public Nodes(String own_port){
 			ports = new String[]{"5554", "5556", "5558", "5560", "5562"};
 			serverPorts = new String[5];
 			hashes = new String[5];
-			replicate = new ArrayList<Integer>();
-
+			recovSend = new String[]{"own", "own.repl1", "", "repl1.repl2", "repl2"};
+			recovSendAs = new String[]{"repl2", "repl1.repl2", "", "own.repl1", "own"};
 			//init server ports
 			for (int i=0; i < 5; i++) {
 				serverPorts[i] = String.valueOf(Integer.parseInt(ports[i]) * 2);
@@ -81,6 +82,12 @@ public class SimpleDynamoProvider extends ContentProvider {
 				if (own_port.equals(ports[i])) ownIdx = i;
 			}
 
+		}
+		private int whatToSend(int other){
+			int diff = ownIdx - other;
+			diff = (diff<-2) ? diff+5 : diff;
+			diff = (diff>2) ? diff-5 : diff;
+			return diff + 2;
 		}
 
 		public String[] whosResponsible(String keyHash){
@@ -93,27 +100,28 @@ public class SimpleDynamoProvider extends ContentProvider {
 				}
 			}
 			return new String[]{serverPorts[resp],
-								serverPorts[resp+1 % 4],
-								serverPorts[resp+2 % 4]};
+								serverPorts[(resp+1) % 5],
+								serverPorts[(resp+2) % 5]};
 		}
 
-		public String[] getReplicas(){
-			return new String[]{serverPorts[ownIdx+1 % 4],
-								serverPorts[ownIdx+2 % 4]};
-		}
-
-		public String[] getResplicating(){
-			return new String[]{
-					serverPorts[(ownIdx + 3) % 5],
-					serverPorts[(ownIdx + 4) % 5]
-			};
-		}
+		public String[] getOthers(){
+			String[] recepients = new String[4];
+			int offset=0;
+			for (int i = 0; i < 5; i++) {
+				if (i != nodes.ownIdx) {
+					recepients[offset] = nodes.serverPorts[i];
+					offset++;
+					}
+				}
+			return recepients;
+			}
 	}
 
 	private static class DatabaseHelper extends SQLiteOpenHelper {
 		static final String DATABASE_NAME = "local_db";
 		static final String MESSAGES_TABLE_NAME = "messages";
 		static final int DATABASE_VERSION = 1;
+
 		static final String TABLE_CONTENT =
 				" (_id INTEGER PRIMARY KEY AUTOINCREMENT, " +
 						" _key TEXT NOT NULL, " +
@@ -124,7 +132,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 		DatabaseHelper(Context context){
 			super(context, DATABASE_NAME, null, DATABASE_VERSION);
-			context.deleteDatabase(DATABASE_NAME);
+//			context.deleteDatabase(DATABASE_NAME);
 		}
 
 		@Override
@@ -138,6 +146,12 @@ public class SimpleDynamoProvider extends ContentProvider {
 		public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
 			db.execSQL("DROP TABLE IF EXISTS " +  MESSAGES_TABLE_NAME);
 			onCreate(db);
+		}
+
+		public boolean isEmpty(SQLiteDatabase db){
+			Cursor c = db.rawQuery("SELECT * FROM own_data", null);
+			Log.e("DATABASE", "database has: " + c.getCount() + " values");
+			return c.getCount() == 0;
 		}
 	}
 
@@ -195,10 +209,89 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 		public void merge(Record newRecord){
 			//TODO: implement merging according to vector clock as timestamp
+			if (this.olderThen(newRecord)) {
+				value = newRecord.value;
+				timestamp = newRecord.timestamp;
+				vector_clock = newRecord.vector_clock;
+				Log.v(TAG, "merge rewritten a record w key: " + key);
+			}
+		}
+
+		public boolean olderThen(Record newRecord){
+			if (timestamp < newRecord.timestamp) return true;
+
+			boolean ge = true;
+			for (int i=0; i < 5; i++){
+				ge = ge & (vector_clock[i] >= newRecord.vector_clock[i]);
+			}
+			return !ge;
 		}
 	}
 
-	private Map<String, Map> valueStorage;
+	private class Storage {
+		private Map<String, Map> data;
+		private Map<String, Integer> sync;
+
+		Storage(){
+			sync = new HashMap<String, Integer>();
+			sync.put("own", 0);
+			sync.put("repl1", 0);
+			sync.put("repl2", 0);
+
+			data = new HashMap<String, Map>();
+			data.put("own", new HashMap<String, Record>());
+			data.put("repl1", new HashMap<String, Record>());
+			data.put("repl2", new HashMap<String, Record>());
+		}
+
+		public void putRecord(String partition, Record record){
+			Map<String, Record> storage = data.get(partition);
+
+			synchronized (storage){ //if performance is bad - synchronize on record
+				if (storage.containsKey(record.key)){
+					storage.get(record.key).merge(record);
+				} else storage.put(record.key, record);
+			}
+			Log.v(TAG, "inserted into "+partition+" key;"+record.key+": "+record.value);
+		}
+
+		public boolean isSynced(){
+			for (int i: sync.values())
+				if (i < 2) return false;
+			Log.v(TAG, "Storage synced");
+			return true;
+		}
+
+		public void syncData(String partition, String recordStrings){
+			Log.v(TAG, "syncing "+ partition);
+			sync.put(partition, sync.get(partition)+1);
+			Map<String, Record> storage = data.get(partition);
+
+			synchronized (storage){
+				for (String recString : recordStrings.split(";")){
+					if (recordStrings.isEmpty()) break;
+					Record newRec = new Record(recString);
+					if (storage.containsKey(newRec.key)) {
+						storage.get(newRec.key).merge(newRec);
+					} else storage.put(newRec.key, newRec);
+				}
+			}
+		}
+
+		public String encodeStorage(String partition){
+			Map<String, Record> storage = data.get(partition);
+			StringBuffer res = new StringBuffer();
+			String prefix = "";
+			for (Record rec : storage.values()){
+				res.append(prefix);
+				res.append(rec.encode());
+				prefix=";";
+			}
+			return res.toString();
+		}
+	}
+
+	private Storage valueStorage;
 
 	private Map<String, Integer> sendConfirm;
 
@@ -212,13 +305,9 @@ public class SimpleDynamoProvider extends ContentProvider {
 		message_queue = new LinkedList<String>();
 		recovery_queue = new LinkedList<String>();
 
-		valueStorage = new HashMap<String, Map>();
-		valueStorage.put("own", new HashMap<String, Record>());
-		valueStorage.put("repl1", new HashMap<String, Record>());
-		valueStorage.put("repl2", new HashMap<String, Record>());
+		valueStorage = new Storage();
 
 		sendConfirm = new HashMap<String, Integer>();
-
 		innerComm  = new InnerComm();
 
 		Log.v(TAG, "initalizing database");
@@ -229,7 +318,6 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 		Log.v(TAG, "DB initialized");
 
-		INITIALIZED = false;
 		try {
 			ServerSocket serverSocket = new ServerSocket(SERVER_PORT);
 			new ServerTask().executeOnExecutor(Pool_server, serverSocket);
@@ -237,8 +325,27 @@ public class SimpleDynamoProvider extends ContentProvider {
 		} catch (Exception e){
 			Log.e(TAG, e.toString());
 		}
-		new MessageProcessorTask().executeOnExecutor(Pool_message);
-		new RecoveryManager();
+		//letting evetybody know you're alive
+
+		if (dbHelper.isEmpty(db)){
+			INITIALIZED = true;
+			Log.e(TAG, "initializing database");
+			//mark that instance is initiated
+			ContentValues dummyVals = new ContentValues();
+			dummyVals.put("_key", "dummyKey");
+			dummyVals.put("value", "dummyVal");
+			db.insert("own_data", null, dummyVals);
+			db.close();
+
+			new MessageProcessorTask().executeOnExecutor(Pool_message, message_queue);
+		} else {
+			Log.e(TAG, "initiating recovery");
+			//initiate recovery
+			new MessageProcessorTask().executeOnExecutor(Pool_message, recovery_queue);
+			new MessageProcessorTask().executeOnExecutor(Pool_message, message_queue);
+
+			new MessageSender("recov_fetch." + nodes.ownIdx, nodes.getOthers()).start();
+		}
 		return db != null;
 	}
 
@@ -268,17 +375,25 @@ public class SimpleDynamoProvider extends ContentProvider {
 		vclock[nodes.ownIdx] = 1; //marking own writing, receiver should just add these vectors
 		Record toSend = new Record(key, value, timestamp, vclock);
 
-		Log.v(TAG, "sendimg messages to: " + receivers[0]);
-		new MessageSender("put.own." + toSend.encode(), receivers[0]).start();
-		new MessageSender("put.repl1." + toSend.encode(), receivers[1]).start();
-		new MessageSender("put.repl2." + toSend.encode(), receivers[2]).start();
+		Log.v(TAG, "sending messages to: " + receivers[0]);
+		StringBuffer buf = new StringBuffer();
+		String[] where  = new String[]{".own.", ".repl1.", ".repl2."};
 
-		//message template put.keyB64.valueB64.c0.c1.c2.c3.c4.timestamp
+		buf.append("put.");
+		buf.append(nodes.serverPorts[nodes.ownIdx]);
+		for (int i=0; i<3; i++){
+			buf.append(where[i]);
+			buf.append(toSend.encode());
+			new MessageSender(buf.toString(), receivers[i]).start();
+			buf.delete(9, buf.length());
+		}
+		// for some reason avd0 got 2 messages in this one
+		// message template put.keyB64.valueB64.c0.c1.c2.c3.c4.timestamp
 
 		synchronized (sendConfirm){
 			sendConfirm.put(key, 2);
 			// waiting for W=2 nodes to respond
-			while (sendConfirm.get(key) != 0){
+			while (sendConfirm.get(key) > 0){
 				try {
 					sendConfirm.wait();
 				} catch (InterruptedException e) {
@@ -293,7 +408,50 @@ public class SimpleDynamoProvider extends ContentProvider {
 	public Cursor query(Uri uri, String[] projection, String selection,
 						String[] selectionArgs, String sortOrder) {
 		// TODO Auto-generated method stubContentValues
-		return null;
+		Log.e(TAG, "Querying " + selection);
+		MatrixCursor result = new MatrixCursor(new String[] {"key","value"});
+
+		// if looking for specific key
+		if (!(selection.equals("*") || selection.equals("@"))) {
+			String[] owners = nodes.whosResponsible(easyHash(selection));
+
+			Log.v(TAG, "locking innerComm.waiting_for");
+			synchronized (innerComm.waiting_for) {
+
+			}
+		}
+
+
+		if (selection.equals("*")){
+//			synchronized (tempValues){
+//				tempValues.clear();
+//			}
+//			Log.v(TAG, "counting messages");
+//			synchronized (innerComm.count) {
+//				new NetworkHelper("sendMessage", "count." + selfPort + ".0", nextPort).start();
+//				try {
+//					innerComm.count.wait();
+//				} catch (InterruptedException e) {
+//					Log.e(TAG, e.toString());
+//				}
+//			}
+//
+//			int final_size = innerComm.count.getAsInteger("value");
+//			Log.v(TAG, "found " + Integer.toString(final_size) + " messages, waiting for them");
+//			synchronized (tempValues){
+//				while (tempValues.size() != final_size){
+//					try {
+//						tempValues.wait(); //released when size == current count
+//					} catch (InterruptedException e) {Log.e(TAG, e.toString());}
+//				}
+//				Log.v(TAG, "wait if over");
+//				for (Map.Entry<String, String> entry : tempValues.entrySet()) {
+//					result.addRow(new Object[] {entry.getKey(), entry.getValue()});
+//				}
+//			}
+		}
+		return result;
+//		return null;
 	}
 
 	@Override
@@ -410,7 +568,6 @@ public class SimpleDynamoProvider extends ContentProvider {
 					int succ = socket.getInputStream().read();
 
 					if (succ == 7) {
-						Log.v(TAG, "Sent message to port: " + remotePort);
 						socket.close();
 						failed = false;
 						break;
@@ -421,158 +578,96 @@ public class SimpleDynamoProvider extends ContentProvider {
 				}
 				catch (UnknownHostException e) {
 					Log.e(TAG, "in send: " + e.toString());
-					break;
-				} catch (SocketTimeoutException e){
+					if (n_failed++ > 3) break;
+				} catch (SocketTimeoutException e){Log.v(TAG, "inMessageSender");
 					Log.e(TAG, "in send: " + e.toString());
-					if (n_failed++ > 2) {
-						break;
-					}
+					if (n_failed++ > 3) break;
 				}catch (IOException e) {
 					Log.e(TAG, "in send: " + e.toString());
-					break;
+					if (n_failed++ > 3) break;
 				}
 			}
 			return failed;
 		}
 
 		public void run() {
-			Log.v(TAG, "inMessageSender");
 			for (String port: receivers){
 				sendMessage(this.message, port);
 			}
 		}
 	}
 
+	enum Callbacks {
+		put, put_confirm, recov_fetch, recov_sync, read_request, read_responce
+	}
+
 	private class MessageProcessorTask extends AsyncTask<LinkedList, Void, Void>{
 		LinkedList<String> processed_queue;
 		boolean finished=false;
 
-//		private void processFind(String body){
-//			String[] asking_keyHash = body.split("\\.",2);
-//			if (myResponsibility(asking_keyHash[1])){
-//				String response = "found." + selfPort + "." + prevPort;
-//				sendMessage(response, asking_keyHash[0]);
-//			} else {
-//				sendMessage("find." + body, nextPort);
-//			}
-//		}
-//
-//		private void processFound(String body){
-//			Log.v(TAG, "processingFound");
-//			String[] selfAndPrev = body.split("\\.",2);
-//			synchronized (innerComm.find){
-//				innerComm.find.put("selfPort", selfAndPrev[0]);
-//				innerComm.find.put("prevPort", selfAndPrev[1]);
-//				innerComm.find.notify();
-//			}
-//			Log.v(TAG, "finishedFound");
-//		}
-//
-//		private void processJoinedPrev(String body){
-//			prevPort = body;
-//			LinkedList<String> toRemove = new LinkedList<String>();
-//			try {
-//				prevHash = genHash(Integer.toString(Integer.parseInt(prevPort)/2));
-//				synchronized (ownValues){
-//					for (Map.Entry<String, String> entry : ownValues.entrySet()) {
-//						String key = entry.getKey();
-//						String value = entry.getValue();
-//						if (genHash(key).compareTo(prevHash) <= 0){
-//							sendMessage("put."+encodeKeyValue(key, value), prevPort);
-//							toRemove.addLast(key);
-//						}
-//					}
-//					for (String removeKey: toRemove){
-//						ownValues.remove(removeKey);
-//					}
-//				}
-//			} catch (NoSuchAlgorithmException e) {Log.e(TAG, e.toString());}
-//		}
-//
-//		private void processJoinedNext(String body){
-//			nextPort = body;
-//		}
-//
-		private void processPut(String body){
-			String[] owner_body = body.split("\\.",2);
-			Record received = new Record(owner_body[1]);
-			Map<String, Record> storage = valueStorage.get(owner_body[0]);
-
-			synchronized (storage){ //if performance is bad - synchronize on record
-				if (storage.containsKey(received.key)){
-					storage.get(received.key).merge(received);
-				} else {
-					storage.put(received.key, received);
-				}
-			}
-			Log.v(TAG, "inserted into "+owner_body[0]+" key;"+received.key+": "+received.value);
-		}
-//
-//		private void processCount(String body){
-//			Log.v(TAG, "received count");
-//			String[] startCount = body.split("\\.",2);
-//			if (startCount[0].equals(selfPort)) {
-//				synchronized (innerComm.count){
-//					innerComm.count.put("value", Integer.parseInt(startCount[1]));
-//					innerComm.count.notify();
-//				}
-//			} else {
-//				synchronized (ownValues){
-//					int newCount = Integer.parseInt(startCount[1]) + ownValues.size();
-//					sendMessage("count."+startCount[0]+"."+Integer.toString(newCount), nextPort);
-//
-//					for (Map.Entry<String, String> entry : ownValues.entrySet()) {
-//						sendMessage("take." + encodeKeyValue(
-//								entry.getKey(),entry.getValue()), startCount[0]);
-//					}
-//				}
-//			}
-//		}
-//
-//		private void processGet(String body){
-//			String[] keyPort = decodeKeyValue(body);
-//			String value = null;
-//			synchronized (ownValues){
-//				value = ownValues.get(keyPort[0]);
-//			}
-//			sendMessage("take."+encodeKeyValue(keyPort[0], value), keyPort[1]);
-//		}
-//
-//		private void processTake(String body){
-//			String[] keyVal = decodeKeyValue(body);
-//			synchronized (tempValues){
-//				tempValues.put(keyVal[0], keyVal[1]);
-//				tempValues.notify();
-//			}
-//		}
-//
-//		private void processClear(String initPort){
-//			if (!initPort.equals(selfPort)){
-//				Log.v(TAG, "received a delete msg");
-//				synchronized (ownValues){
-//					ownValues.clear();
-//					new MessageSender("sendMessage","clear."+initPort, nextPort).start();
-//				}
-//			}
-//		}
-//
-//		private void processDelete(String body){
-//			String[] keyPort = decodeKeyValue(body);
-//			Log.v(TAG, "deleting " + keyPort[0]);
-//			synchronized (ownValues){
-//				ownValues.remove(keyPort[0]);
-//			}
-//		}
-//
 		private void processMessage(String message){
 			String[] prefix_body = message.split("\\.",2);
-			if (prefix_body[0].equals("put")) {
-				processPut(prefix_body[1]);
+
+			switch (Callbacks.valueOf(prefix_body[0])){
+				case put:
+					processPut(prefix_body[1]);
+					break;
+				case put_confirm:
+					processPutConfirm(prefix_body[1]);
+					break;
+				case recov_fetch:
+					processFetch(prefix_body[1]);
+					break;
+
+				case recov_sync:
+					processSync(prefix_body[1]);
 			}
+		}
+
+		private void processPutConfirm(String key){
+			Log.v(TAG, "received confirmation");
+			synchronized (sendConfirm){
+				int curr = sendConfirm.get(key);
+				sendConfirm.put(key, curr-1);
+				sendConfirm.notify();
+			}
+		}
+
+		private void processPut(String body){
+			String[] from_owner_body = body.split("\\.",3);
+			Record received = new Record(from_owner_body[2]);
+			valueStorage.putRecord(from_owner_body[1], received);
+			Log.v(TAG, "sending put confirmation");
+			new MessageSender("put_confirm." + received.key, from_owner_body[0]).start();
+		}
+
+		private void processSync(String body){
+			Log.v(TAG, "processing sync: " + body);
+			String[] owner_body = body.split("\\.",2);
+			valueStorage.syncData(owner_body[0], owner_body[1]);
+			if (valueStorage.isSynced()) finished=true;
+		}
+
+		private void processFetch(String body){
+			int who = Integer.parseInt(body);
+			//determine which data this node needs
+			int sendIdx = nodes.whatToSend(who);
+			String[] send = nodes.recovSend[sendIdx].split("\\.");
+			String[] sendAs = nodes.recovSendAs[sendIdx].split("\\.");
+
+			String sentLog = "";
+			for (int i=0; i < send.length; i++){
+				if (!sendAs[i].isEmpty()) {
+					new MessageSender("recov_sync." + sendAs[i] + "." + valueStorage.encodeStorage(send[i]), nodes.serverPorts[who]).start();
+					sentLog += sendAs[i] + ",";
+				}
+			}
+			Log.v(TAG, "processing fetch from " + body + "; Sent "+sendIdx +" " + sentLog);
 		}
 
 		@Override
 		protected Void doInBackground(LinkedList... params){
+			Log.v(TAG, "started MessageProcessor");
 			processed_queue = params[0];
 			while (!finished){
 				synchronized (processed_queue){
@@ -583,36 +678,10 @@ public class SimpleDynamoProvider extends ContentProvider {
 							Log.e(TAG, e.toString());
 							break;
 						}
-					} else {
-						processMessage(processed_queue.pop());
-					}
+					} else processMessage(processed_queue.pop());
 				}
 			}
 			return null;
-		}
-	}
-
-	private class RecoveryManager{
-		public RecoveryManager() {
-			//TODO: implement checking and recovery
-			String[] repl12 = nodes.getReplicas();
-			String[] _repl12 = nodes.getResplicating();
-			String[] recepients = new String[]{repl12[0], repl12[1], _repl12[0], _repl12[1]};
-
-			// getting own data
-			new MessageSender("recov.fetch." + nodes.ownIdx, recepients);
-		}
-
-		private void processMessage(String message){
-			String[] header_body = message.split("\\.");
-			if (header_body[0].equals("recov_collect")){
-				processCollect(header_body[1]);
-			} else if (header_body[0].equals("other")){
-
-			}
-		}
-		private void processCollect(String body){
-
 		}
 	}
 } //ContentProvider
