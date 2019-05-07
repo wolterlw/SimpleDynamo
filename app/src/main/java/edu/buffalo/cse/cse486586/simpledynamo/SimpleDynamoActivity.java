@@ -15,6 +15,7 @@ import android.widget.TextView;
 import java.util.concurrent.TimeUnit;
 
 public class SimpleDynamoActivity extends Activity {
+	private static String TAG = "in activity";
 
 	private static Uri buildUri(String scheme, String authority) {
 		Uri.Builder uriBuilder = new Uri.Builder();
@@ -36,14 +37,16 @@ public class SimpleDynamoActivity extends Activity {
 		findViewById(R.id.button).setOnClickListener(new View.OnClickListener() {
 			@Override
 			public void onClick(View v) {
-				Log.v("in activity", "initiating TEST");
+				Log.v(TAG, "initiating TEST");
 				for (int i=0; i < 50; i++){
 					ContentValues cv = new ContentValues();
-					cv.put("key", "key "+i);
-					cv.put("value", "value "+i);
+					cv.put("key", "key"+i);
+					cv.put("value", "value"+i);
 					getContentResolver().insert(provider_uri, cv);
-					Log.v("in activity", "inserted pair " + i);
+					Log.v(TAG, "inserted pair " + i);
 				}
+				Log.v(TAG, "querying key15");
+				getContentResolver().query(provider_uri, null, "key15", null, null);
 			}
 		});
 	}

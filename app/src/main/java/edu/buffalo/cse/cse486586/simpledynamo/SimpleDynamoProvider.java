@@ -40,9 +40,34 @@ public class SimpleDynamoProvider extends ContentProvider {
 	private String ownPort;
 	private int SERVER_PORT=10000;
 	private boolean INITIALIZED = false;
+	private int MIN_R = 2;
+	private int MIN_W = 2;
 
 	private class InnerComm{
-		public Map<String, Record> waiting_for = new HashMap<String, Record>();
+		public Map<String, Record> waiting_for;
+		public Map<String, Integer> recvConfirm;
+		public Map<String, Integer> sendConfirm;
+
+		public InnerComm(){
+			waiting_for = new HashMap<String, Record>();
+			recvConfirm = new HashMap<String, Integer>();
+			sendConfirm = new HashMap<String, Integer>();
+		}
+
+		public void initRecv(String key){
+			waiting_for.put(key, new Record(key, null));
+			recvConfirm.put(key, MIN_R);
+		}
+
+		public void addRecv(String key, Record record){
+			waiting_for.get(key).merge(record);
+			int curr = recvConfirm.get(key);
+			recvConfirm.put(key, curr - 1);
+		}
+
+		public boolean isReceived(String key){
+			return recvConfirm.get(key) <= 0;
+		}
 	}
 	private InnerComm innerComm;
 
@@ -161,6 +186,13 @@ public class SimpleDynamoProvider extends ContentProvider {
 		private int[] vector_clock;
 		private long timestamp;
 
+		public Record(String key_, String val){
+			key = key_;
+			value = val;
+			vector_clock = new int[]{0,0,0,0,0};
+			timestamp = 0;
+		}
+
 		public Record(String encoding){
 			Log.v(TAG, "parsing rec: "+ encoding);
 			String[] split = encoding.split("\\.");
@@ -255,6 +287,10 @@ public class SimpleDynamoProvider extends ContentProvider {
 			Log.v(TAG, "inserted into "+partition+" key;"+record.key+": "+record.value);
 		}
 
+		public Record getRecord(String partition, String key){
+			return (Record) data.get(partition).get(key);
+		}
+
 		public boolean isSynced(){
 			for (int i: sync.values())
 				if (i < 2) return false;
@@ -293,7 +329,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 	private Storage valueStorage;
 
-	private Map<String, Integer> sendConfirm;
+//	private Map<String, Integer> innerComm.sendConfirm;
 
 	@Override
 	public boolean onCreate() {
@@ -306,8 +342,6 @@ public class SimpleDynamoProvider extends ContentProvider {
 		recovery_queue = new LinkedList<String>();
 
 		valueStorage = new Storage();
-
-		sendConfirm = new HashMap<String, Integer>();
 		innerComm  = new InnerComm();
 
 		Log.v(TAG, "initalizing database");
@@ -390,18 +424,27 @@ public class SimpleDynamoProvider extends ContentProvider {
 		// for some reason avd0 got 2 messages in this one
 		// message template put.keyB64.valueB64.c0.c1.c2.c3.c4.timestamp
 
-		synchronized (sendConfirm){
-			sendConfirm.put(key, 2);
+		synchronized (innerComm.sendConfirm){
+			innerComm.sendConfirm.put(key, MIN_W);
 			// waiting for W=2 nodes to respond
-			while (sendConfirm.get(key) > 0){
+			while (innerComm.sendConfirm.get(key) > 0){
 				try {
-					sendConfirm.wait();
+					innerComm.sendConfirm.wait();
 				} catch (InterruptedException e) {
 					Log.e(TAG, e.toString());
 				}
 			}
 		}
 		return null;
+	}
+
+	public void sendTo3(String prefix, String suffix, String[] recepients){
+		String[] messages = new String[3];
+		String[] partitions = new String[]{".own.",".repl1.",".repl2."};
+		for (int i=0; i<3; i++){
+			messages[i] = prefix + partitions[i] + suffix;
+		}
+		new MessageSender(messages, recepients).start();
 	}
 
 	@Override
@@ -411,45 +454,36 @@ public class SimpleDynamoProvider extends ContentProvider {
 		Log.e(TAG, "Querying " + selection);
 		MatrixCursor result = new MatrixCursor(new String[] {"key","value"});
 
-		// if looking for specific key
+		// if looking for a specific key
 		if (!(selection.equals("*") || selection.equals("@"))) {
 			String[] owners = nodes.whosResponsible(easyHash(selection));
 
 			Log.v(TAG, "locking innerComm.waiting_for");
-			synchronized (innerComm.waiting_for) {
+			synchronized (innerComm.recvConfirm) {
+				innerComm.initRecv(selection);
 
+				sendTo3("read_one_request."+nodes.serverPorts[nodes.ownIdx], selection, owners);
+
+				while (!innerComm.isReceived(selection))
+					try {
+						innerComm.recvConfirm.wait();
+					} catch (InterruptedException e) {Log.e(TAG, e.toString());}
 			}
+			synchronized (innerComm.waiting_for){
+				Record received = innerComm.waiting_for.get(selection);
+				result.addRow(new Object[]{received.key, received.value });
+			}
+			//Logging
+			result.moveToFirst();
+			Log.e("OUTPUT", "returning: " + result.getString(0) + " " + result.getString(1));
+			return result;
 		}
 
 
-		if (selection.equals("*")){
-//			synchronized (tempValues){
-//				tempValues.clear();
-//			}
-//			Log.v(TAG, "counting messages");
-//			synchronized (innerComm.count) {
-//				new NetworkHelper("sendMessage", "count." + selfPort + ".0", nextPort).start();
-//				try {
-//					innerComm.count.wait();
-//				} catch (InterruptedException e) {
-//					Log.e(TAG, e.toString());
-//				}
-//			}
-//
-//			int final_size = innerComm.count.getAsInteger("value");
-//			Log.v(TAG, "found " + Integer.toString(final_size) + " messages, waiting for them");
-//			synchronized (tempValues){
-//				while (tempValues.size() != final_size){
-//					try {
-//						tempValues.wait(); //released when size == current count
-//					} catch (InterruptedException e) {Log.e(TAG, e.toString());}
-//				}
-//				Log.v(TAG, "wait if over");
-//				for (Map.Entry<String, String> entry : tempValues.entrySet()) {
-//					result.addRow(new Object[] {entry.getKey(), entry.getValue()});
-//				}
-//			}
-		}
+		if (selection.equals("@"))
+			for (String partition : new String[]{"own","repl1","repl2"})
+				for (Record rec: (List<Record>) valueStorage.data.get(partition).values())
+					result.addRow(new String[]{rec.key, rec.value});
 		return result;
 //		return null;
 	}
@@ -532,16 +566,23 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 	private class MessageSender extends Thread {
 		String message;
+		String receiver;
+		String[] messages;
 		String[] receivers;
 
 		public MessageSender(String message, String remotePort) {
 			this.message = message;
-			this.receivers = new String[]{remotePort};
+			this.receiver = remotePort;
 		}
 
 		public MessageSender(String message, String[] remotePorts) {
 			this.message = message;
 			this.receivers = remotePorts;
+		}
+
+		public MessageSender(String[] messages, String[] receivers){
+			this.messages = messages;
+			this.receivers = receivers;
 		}
 
 		private boolean sendMessage(String message, String remotePort) {
@@ -590,15 +631,23 @@ public class SimpleDynamoProvider extends ContentProvider {
 			return failed;
 		}
 
-		public void run() {
-			for (String port: receivers){
-				sendMessage(this.message, port);
-			}
+		public void run(){
+			if ((receiver != null) && (receiver != null))
+				sendMessage(message, receiver);
+			else{
+				if ((message != null) && (receivers != null)) {
+					for (String recv : receivers)
+						sendMessage(message, recv);
+				} else
+					for (int i=0; i<receivers.length; i++)
+						sendMessage(messages[i], receivers[i]);
+				}
 		}
 	}
 
 	enum Callbacks {
-		put, put_confirm, recov_fetch, recov_sync, read_request, read_responce
+		put, put_confirm, recov_fetch, recov_sync, read_one_request, read_one_response,
+		read_part_request, read_part_response
 	}
 
 	private class MessageProcessorTask extends AsyncTask<LinkedList, Void, Void>{
@@ -609,6 +658,18 @@ public class SimpleDynamoProvider extends ContentProvider {
 			String[] prefix_body = message.split("\\.",2);
 
 			switch (Callbacks.valueOf(prefix_body[0])){
+				case read_part_request:
+					processReadPartRequest(prefix_body[1]);
+					break;
+				case read_part_response:
+					processReadPartResponse(prefix_body[1]);
+					break;
+				case read_one_response:
+					processReadOneResponse(prefix_body[1]);
+					break;
+				case read_one_request:
+					processReadOneRequest(prefix_body[1]);
+					break;
 				case put:
 					processPut(prefix_body[1]);
 					break;
@@ -618,18 +679,41 @@ public class SimpleDynamoProvider extends ContentProvider {
 				case recov_fetch:
 					processFetch(prefix_body[1]);
 					break;
-
 				case recov_sync:
 					processSync(prefix_body[1]);
+					break;
 			}
+		}
+
+		private void processReadPartRequest(String body){
+
+		}
+
+		private void processReadPartResponse(String body){
+
+		}
+
+		private void processReadOneResponse(String body){
+			synchronized (innerComm.recvConfirm){
+				Record newRec = new Record(body);
+				innerComm.addRecv(newRec.key, newRec);
+				innerComm.recvConfirm.notify();
+				Log.e(TAG, "received record " + newRec.key + " " + newRec.value);
+			}
+		}
+
+		private void processReadOneRequest(String body){
+			String[] sendTo_part_key = body.split("\\.",3);
+			Record rec = valueStorage.getRecord(sendTo_part_key[1], sendTo_part_key[2]);
+			new MessageSender("read_one_response." + rec.encode(), sendTo_part_key[0]).start();
 		}
 
 		private void processPutConfirm(String key){
 			Log.v(TAG, "received confirmation");
-			synchronized (sendConfirm){
-				int curr = sendConfirm.get(key);
-				sendConfirm.put(key, curr-1);
-				sendConfirm.notify();
+			synchronized (innerComm.sendConfirm){
+				int curr = innerComm.sendConfirm.get(key);
+				innerComm.sendConfirm.put(key, curr-1);
+				innerComm.sendConfirm.notify();
 			}
 		}
 
