@@ -12,12 +12,16 @@ import java.net.UnknownHostException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.Formatter;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Scanner;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -34,24 +38,31 @@ import android.telephony.TelephonyManager;
 import android.util.Base64;
 import android.util.Log;
 
+//TODO:
+// 1. code delete functionality
+// 2.
+
 public class SimpleDynamoProvider extends ContentProvider {
 
 	String TAG="In content provider";
+	private static int SERVER_PORT=10000;
+	private static String[] PARTITIONS = new String[]{"own", "repl1", "repl2"};
+	private static int MIN_R = 2;
+	private static int MIN_W = 2;
 	private String ownPort;
-	private int SERVER_PORT=10000;
 	private boolean INITIALIZED = false;
-	private int MIN_R = 2;
-	private int MIN_W = 2;
 
 	private class InnerComm{
 		public Map<String, Record> waiting_for;
 		public Map<String, Integer> recvConfirm;
 		public Map<String, Integer> sendConfirm;
+		public Map<String, Set> setConfirm;
 
 		public InnerComm(){
 			waiting_for = new HashMap<String, Record>();
 			recvConfirm = new HashMap<String, Integer>();
 			sendConfirm = new HashMap<String, Integer>();
+			setConfirm = new HashMap<String, Set>();
 		}
 
 		public void initRecv(String key){
@@ -93,6 +104,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 		private int ownIdx;
 		private String[] recovSend;
 		private String[] recovSendAs;
+		private Set<String> activeNodes;
 
 		public Nodes(String own_port){
 			ports = new String[]{"5554", "5556", "5558", "5560", "5562"};
@@ -106,13 +118,29 @@ public class SimpleDynamoProvider extends ContentProvider {
 				hashes[i] = easyHash(ports[i]);
 				if (own_port.equals(ports[i])) ownIdx = i;
 			}
-
+			activeNodes = new HashSet<String>(Arrays.asList(serverPorts));
 		}
 		private int whatToSend(int other){
 			int diff = ownIdx - other;
 			diff = (diff<-2) ? diff+5 : diff;
 			diff = (diff>2) ? diff-5 : diff;
 			return diff + 2;
+		}
+
+		private Set<String> filterActive(String[] nodes){
+			Set<String> intersection = new HashSet<String>(Arrays.asList(nodes));
+			synchronized (activeNodes) {
+				intersection.retainAll(activeNodes);
+			}
+			return intersection;
+		}
+
+		private Set<String> filterActive(Set<String> nodes){
+			Set<String> intersection = new HashSet<String>(nodes);
+			synchronized (activeNodes) {
+				intersection.retainAll(activeNodes);
+			}
+			return intersection;
 		}
 
 		public String[] whosResponsible(String keyHash){
@@ -140,6 +168,11 @@ public class SimpleDynamoProvider extends ContentProvider {
 				}
 			return recepients;
 			}
+
+		public void reportMissing(String nodePort){ activeNodes.remove(nodePort); Log.e("NODES",nodePort + "reported missing");}
+		public void reportRecovery(String nodePort){ activeNodes.add(nodePort); }
+		public int getNumActive(){return activeNodes.size();}
+		public String getOwnPort(){return serverPorts[ownIdx];}
 	}
 
 	private static class DatabaseHelper extends SQLiteOpenHelper {
@@ -274,6 +307,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 			data.put("own", new HashMap<String, Record>());
 			data.put("repl1", new HashMap<String, Record>());
 			data.put("repl2", new HashMap<String, Record>());
+			data.put("temp", new HashMap<String, Record>());
 		}
 
 		public void putRecord(String partition, Record record){
@@ -284,23 +318,39 @@ public class SimpleDynamoProvider extends ContentProvider {
 					storage.get(record.key).merge(record);
 				} else storage.put(record.key, record);
 			}
-			Log.v(TAG, "inserted into "+partition+" key;"+record.key+": "+record.value);
+			Log.v(TAG, "inserted into " + partition + " key;"+record.key+": "+record.value);
 		}
 
 		public Record getRecord(String partition, String key){
 			return (Record) data.get(partition).get(key);
 		}
 
-		public boolean isSynced(){
+		public void delRecord(String key){
+			for (Map<String, Record> partition : data.values())
+				if (partition.containsKey(key)) partition.remove(key);
+		}
+
+		public void resetSync(){
+			sync.put("own", 0);
+			sync.put("repl1", 0);
+			sync.put("repl2", 0);
+		}
+
+		public int syncMin(){
+			int min = 0;
 			for (int i: sync.values())
-				if (i < 2) return false;
-			Log.v(TAG, "Storage synced");
-			return true;
+				min = i < min ? i : min;
+			return min;
 		}
 
 		public void syncData(String partition, String recordStrings){
-			Log.v(TAG, "syncing "+ partition);
-			sync.put(partition, sync.get(partition)+1);
+			String sync_part = partition;
+			if (partition.contains("temp")) {
+				sync_part = partition.substring(5);
+				partition = "temp";
+			}
+			Log.v(TAG, "syncing "+ sync_part);
+			sync.put(sync_part, sync.get(sync_part)+1);
 			Map<String, Record> storage = data.get(partition);
 
 			synchronized (storage){
@@ -325,11 +375,15 @@ public class SimpleDynamoProvider extends ContentProvider {
 			}
 			return res.toString();
 		}
+
+		public void clear(){
+			data.get("own").clear();
+			data.get("repl1").clear();
+			data.get("repl2").clear();
+		}
 	}
 
 	private Storage valueStorage;
-
-//	private Map<String, Integer> innerComm.sendConfirm;
 
 	@Override
 	public boolean onCreate() {
@@ -359,7 +413,6 @@ public class SimpleDynamoProvider extends ContentProvider {
 		} catch (Exception e){
 			Log.e(TAG, e.toString());
 		}
-		//letting evetybody know you're alive
 
 		if (dbHelper.isEmpty(db)){
 			INITIALIZED = true;
@@ -375,6 +428,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 		} else {
 			Log.e(TAG, "initiating recovery");
 			//initiate recovery
+			valueStorage.resetSync();
 			new MessageProcessorTask().executeOnExecutor(Pool_message, recovery_queue);
 			new MessageProcessorTask().executeOnExecutor(Pool_message, message_queue);
 
@@ -386,6 +440,31 @@ public class SimpleDynamoProvider extends ContentProvider {
 	@Override
 	public int delete(Uri uri, String selection, String[] selectionArgs) {
 		// TODO Auto-generated method stub
+		if (selection.equals("@")){
+			valueStorage.clear();
+			Log.v("OUTPUT", "deleted own values");
+			return 0;
+		}
+
+		synchronized (innerComm.setConfirm){
+			innerComm.setConfirm.clear();
+			String[] recepients;
+			if (selection.equals("*")) recepients = nodes.getOthers();
+			else recepients = nodes.whosResponsible(easyHash(selection));
+
+			innerComm.setConfirm.put("delete", new HashSet<String>(5));
+
+			new MessageSender("delete_request." + selection + "." + nodes.getOwnPort(), recepients).start();
+
+			while (nodes.filterActive(recepients).equals(
+				   nodes.filterActive(innerComm.setConfirm.get("delete")))
+			) try {
+				innerComm.setConfirm.wait(1000);
+				Log.v(TAG, "woke up in delete, in setConfirm: " + innerComm.setConfirm.get("delete").toString());
+				new MessageSender("ping."+nodes.getOwnPort(), nodes.serverPorts).start();
+			} catch (InterruptedException e) {Log.e(TAG, e.toString());}
+		}
+		Log.i("OUTPUT", "deleted " + selection);
 		return 0;
 	}
 
@@ -409,7 +488,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 		vclock[nodes.ownIdx] = 1; //marking own writing, receiver should just add these vectors
 		Record toSend = new Record(key, value, timestamp, vclock);
 
-		Log.v(TAG, "sending messages to: " + receivers[0]);
+		Log.e(TAG, "sending record "+key+ " to: " + receivers[0] + " " + receivers[1] + " " + receivers[2]);
 		StringBuffer buf = new StringBuffer();
 		String[] where  = new String[]{".own.", ".repl1.", ".repl2."};
 
@@ -473,19 +552,40 @@ public class SimpleDynamoProvider extends ContentProvider {
 				Record received = innerComm.waiting_for.get(selection);
 				result.addRow(new Object[]{received.key, received.value });
 			}
-			//Logging
-			result.moveToFirst();
-			Log.e("OUTPUT", "returning: " + result.getString(0) + " " + result.getString(1));
 			return result;
 		}
 
 
 		if (selection.equals("@"))
 			for (String partition : new String[]{"own","repl1","repl2"})
-				for (Record rec: (List<Record>) valueStorage.data.get(partition).values())
+				for (Record rec: (Collection<Record>) valueStorage.data.get(partition).values())
 					result.addRow(new String[]{rec.key, rec.value});
+
+
+		if (selection.equals("*")){
+			synchronized (valueStorage.data){
+				Map<String, Record> storage = valueStorage.data.get("temp");
+				for (String partition : PARTITIONS)
+					for (Record rec: (Collection<Record>) valueStorage.data.get(partition).values())
+						storage.put(rec.key, rec);
+			}
+			valueStorage.resetSync();
+			Log.v(TAG, "inserted own values");
+			for (String partition: PARTITIONS){
+				new MessageSender("read_part_request."+partition + "." + nodes.ownIdx,
+						nodes.getOthers()).start();
+				synchronized (valueStorage.sync){
+					while (valueStorage.sync.get(partition) < 4) try {
+						Log.v(TAG, "sync state: " + valueStorage.sync.toString());
+						valueStorage.sync.wait();
+					} catch (InterruptedException e) {Log.e(TAG, e.toString());}
+				}
+			}
+
+			for (Record rec: (Collection<Record>) valueStorage.data.get("temp").values())
+				result.addRow(new String[]{rec.key, rec.value});
+		}
 		return result;
-//		return null;
 	}
 
 	@Override
@@ -619,13 +719,13 @@ public class SimpleDynamoProvider extends ContentProvider {
 				}
 				catch (UnknownHostException e) {
 					Log.e(TAG, "in send: " + e.toString());
-					if (n_failed++ > 3) break;
+					if (n_failed++ > 3) {nodes.reportMissing(remotePort); break;}
 				} catch (SocketTimeoutException e){Log.v(TAG, "inMessageSender");
 					Log.e(TAG, "in send: " + e.toString());
-					if (n_failed++ > 3) break;
+					if (n_failed++ > 3) {nodes.reportMissing(remotePort); break;}
 				}catch (IOException e) {
 					Log.e(TAG, "in send: " + e.toString());
-					if (n_failed++ > 3) break;
+					if (n_failed++ > 3) {nodes.reportMissing(remotePort); break;}
 				}
 			}
 			return failed;
@@ -647,7 +747,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 	enum Callbacks {
 		put, put_confirm, recov_fetch, recov_sync, read_one_request, read_one_response,
-		read_part_request, read_part_response
+		read_part_request, read_part_response, delete_request, delete_response, ping
 	}
 
 	private class MessageProcessorTask extends AsyncTask<LinkedList, Void, Void>{
@@ -658,6 +758,14 @@ public class SimpleDynamoProvider extends ContentProvider {
 			String[] prefix_body = message.split("\\.",2);
 
 			switch (Callbacks.valueOf(prefix_body[0])){
+				case ping:
+					break;
+				case delete_response:
+					processDeleteResponse(prefix_body[1]);
+					break;
+				case delete_request:
+					processDeleteRequest(prefix_body[1]);
+					break;
 				case read_part_request:
 					processReadPartRequest(prefix_body[1]);
 					break;
@@ -685,12 +793,33 @@ public class SimpleDynamoProvider extends ContentProvider {
 			}
 		}
 
-		private void processReadPartRequest(String body){
+		private void processDeleteResponse(String nodePort){
+			//delete_response.nodePort
+			synchronized (innerComm.setConfirm){
+				innerComm.setConfirm.get("delete").add(nodePort);
+				innerComm.setConfirm.notify();
+			}
+		}
 
+		private void processDeleteRequest(String body){
+			String[] key_backaddr = body.split("\\.",2);
+			if (key_backaddr[0].equals("*")) valueStorage.clear();
+			else valueStorage.delRecord(key_backaddr[0]);
+			new MessageSender("delete_response."+nodes.getOwnPort(), key_backaddr[1]).start();
+		}
+
+		private void processReadPartRequest(String body){
+			String[] part_who = body.split("\\.");
+			int who = Integer.parseInt(part_who[1]);
+			new MessageSender("read_part_response." + part_who[0]+ "." + valueStorage.encodeStorage(part_who[0]), nodes.serverPorts[who]).start();
 		}
 
 		private void processReadPartResponse(String body){
-
+			String[] part_body = body.split("\\.",2);
+			valueStorage.syncData("temp_"+part_body[0], part_body[1]);
+			synchronized (valueStorage.sync){
+				valueStorage.sync.notify();
+			}
 		}
 
 		private void processReadOneResponse(String body){
@@ -703,8 +832,10 @@ public class SimpleDynamoProvider extends ContentProvider {
 		}
 
 		private void processReadOneRequest(String body){
+			Log.v(TAG, "readOneRequest body: " + body);
 			String[] sendTo_part_key = body.split("\\.",3);
 			Record rec = valueStorage.getRecord(sendTo_part_key[1], sendTo_part_key[2]);
+
 			new MessageSender("read_one_response." + rec.encode(), sendTo_part_key[0]).start();
 		}
 
@@ -729,7 +860,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 			Log.v(TAG, "processing sync: " + body);
 			String[] owner_body = body.split("\\.",2);
 			valueStorage.syncData(owner_body[0], owner_body[1]);
-			if (valueStorage.isSynced()) finished=true;
+			if (valueStorage.syncMin() >= 2) finished=true;
 		}
 
 		private void processFetch(String body){
@@ -747,6 +878,11 @@ public class SimpleDynamoProvider extends ContentProvider {
 				}
 			}
 			Log.v(TAG, "processing fetch from " + body + "; Sent "+sendIdx +" " + sentLog);
+			// reporting the recovery of a node
+			synchronized (nodes){
+				nodes.reportRecovery(nodes.serverPorts[who]);
+				Log.e(TAG, "reporting recovered node. # active: " + nodes.getNumActive());
+			}
 		}
 
 		@Override

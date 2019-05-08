@@ -38,15 +38,54 @@ public class SimpleDynamoActivity extends Activity {
 			@Override
 			public void onClick(View v) {
 				Log.v(TAG, "initiating TEST");
-				for (int i=0; i < 50; i++){
+				for (int i=15; i < 25; i++){
 					ContentValues cv = new ContentValues();
 					cv.put("key", "key"+i);
 					cv.put("value", "value"+i);
 					getContentResolver().insert(provider_uri, cv);
 					Log.v(TAG, "inserted pair " + i);
 				}
-				Log.v(TAG, "querying key15");
-				getContentResolver().query(provider_uri, null, "key15", null, null);
+				Log.v(TAG, "querying key19");
+				Cursor res = getContentResolver().query(provider_uri, null, "key19", null, null);
+
+				try {
+					while (res.moveToNext()) {
+						Log.i("OUTPUT", "key: " + res.getString(0) + " value: " + res.getString(1));
+					}
+				} finally {
+					res.close();
+				}
+
+				// TESTING DELETE
+				getContentResolver().delete(provider_uri, "key19", null);
+				Log.i("OUTPUT", "deleted key19");
+
+				Log.v(TAG, "querying *");
+				Cursor res2 = getContentResolver().query(provider_uri, null, "*", null, null);
+
+				try {
+					while (res2.moveToNext()) {
+						Log.i("OUTPUT", "key: " + res2.getString(0) + " value: " + res2.getString(1));
+					}
+				} finally {
+					res2.close();
+				}
+
+				getContentResolver().delete(provider_uri, "@", null);
+
+				Log.v(TAG, "querying @");
+				Cursor res1 = getContentResolver().query(provider_uri, null, "@", null, null);
+
+				try {
+					while (res1.moveToNext()) {
+						Log.i("OUTPUT", "key: " + res1.getString(0) + " value: " + res1.getString(1));
+					}
+				} finally {
+					res1.close();
+				}
+
+				getContentResolver().delete(provider_uri, "*", null);
+
 			}
 		});
 	}
