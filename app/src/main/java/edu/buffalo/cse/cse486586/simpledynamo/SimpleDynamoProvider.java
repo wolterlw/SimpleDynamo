@@ -107,7 +107,9 @@ public class SimpleDynamoProvider extends ContentProvider {
 		private Set<String> activeNodes;
 
 		public Nodes(String own_port){
-			ports = new String[]{"5554", "5556", "5558", "5560", "5562"};
+//			4,1,0,2,3
+
+			ports = new String[]{"5562", "5556", "5554", "5558", "5560"};
 			serverPorts = new String[5];
 			hashes = new String[5];
 			recovSend = new String[]{"own", "own.repl1", "", "repl1.repl2", "repl2"};
@@ -119,6 +121,8 @@ public class SimpleDynamoProvider extends ContentProvider {
 				if (own_port.equals(ports[i])) ownIdx = i;
 			}
 			activeNodes = new HashSet<String>(Arrays.asList(serverPorts));
+
+			Log.v("NODES:", "node hashes: " + hashes[0] + " " + hashes[1]);
 		}
 		private int whatToSend(int other){
 			int diff = ownIdx - other;
@@ -146,7 +150,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 		public String[] whosResponsible(String keyHash){
 			int resp = 0;
 
-			for (int i=0; i<5; i++){
+			for (int i=0; i < 5; i++){
 				if (keyHash.compareTo(hashes[i]) < 0) {
 					resp = i;
 					break;
@@ -337,7 +341,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 		}
 
 		public int syncMin(){
-			int min = 0;
+			int min = 5;
 			for (int i: sync.values())
 				min = i < min ? i : min;
 			return min;
@@ -483,12 +487,12 @@ public class SimpleDynamoProvider extends ContentProvider {
 		long timestamp = System.currentTimeMillis();
 		String keyHash = easyHash(key);
 		String[] receivers = nodes.whosResponsible(keyHash);
+		Log.e(TAG, "sending record " + keyHash + " to: " + receivers[0] + " " + receivers[1] + " " + receivers[2]);
 
 		int[] vclock = {0,0,0,0,0};
 		vclock[nodes.ownIdx] = 1; //marking own writing, receiver should just add these vectors
 		Record toSend = new Record(key, value, timestamp, vclock);
 
-		Log.e(TAG, "sending record "+key+ " to: " + receivers[0] + " " + receivers[1] + " " + receivers[2]);
 		StringBuffer buf = new StringBuffer();
 		String[] where  = new String[]{".own.", ".repl1.", ".repl2."};
 
@@ -508,7 +512,8 @@ public class SimpleDynamoProvider extends ContentProvider {
 			// waiting for W=2 nodes to respond
 			while (innerComm.sendConfirm.get(key) > 0){
 				try {
-					innerComm.sendConfirm.wait();
+					innerComm.sendConfirm.wait(3000);
+					Log.e(TAG, "checked sendConfirm ("+key+") got " + innerComm.sendConfirm.get(key));
 				} catch (InterruptedException e) {
 					Log.e(TAG, e.toString());
 				}
@@ -575,7 +580,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 				new MessageSender("read_part_request."+partition + "." + nodes.ownIdx,
 						nodes.getOthers()).start();
 				synchronized (valueStorage.sync){
-					while (valueStorage.sync.get(partition) < 4) try {
+					while (valueStorage.sync.get(partition) < 3) try { //not 4 because own values included alreay
 						Log.v(TAG, "sync state: " + valueStorage.sync.toString());
 						valueStorage.sync.wait();
 					} catch (InterruptedException e) {Log.e(TAG, e.toString());}
@@ -642,6 +647,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 					break;
 				}
 				if (!INITIALIZED){
+					Log.e(TAG, "RECEIVED MESSAGE IN RECOVERY MODE");
 					if (message.substring(0,5).equals("recov")){
 						synchronized (recovery_queue){
 							recovery_queue.add(message);
@@ -860,7 +866,10 @@ public class SimpleDynamoProvider extends ContentProvider {
 			Log.v(TAG, "processing sync: " + body);
 			String[] owner_body = body.split("\\.",2);
 			valueStorage.syncData(owner_body[0], owner_body[1]);
-			if (valueStorage.syncMin() >= 2) finished=true;
+			if (valueStorage.syncMin() >= 2) {
+				finished=true;  INITIALIZED=true;
+				Log.e(TAG, "STORAGE SYNCHRONIZED");
+			}
 		}
 
 		private void processFetch(String body){
@@ -901,6 +910,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 					} else processMessage(processed_queue.pop());
 				}
 			}
+			Log.e(TAG, "EXITING MESSAGE PROCESSOR");
 			return null;
 		}
 	}

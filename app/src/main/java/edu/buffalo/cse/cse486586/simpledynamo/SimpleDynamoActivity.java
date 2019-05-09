@@ -86,6 +86,11 @@ public class SimpleDynamoActivity extends Activity {
 
 				getContentResolver().delete(provider_uri, "*", null);
 
+				ContentValues cv = new ContentValues();
+				cv.put("key", "sZFA8F2ZMwO22I0FVV088tYj6hCDLugq");
+				cv.put("value", "some_value");
+				getContentResolver().insert(provider_uri, cv);
+
 			}
 		});
 	}
